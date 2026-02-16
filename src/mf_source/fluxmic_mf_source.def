@@ -1,0 +1,6 @@
+LIBRARY "fluxmic_mf_cam"
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE
