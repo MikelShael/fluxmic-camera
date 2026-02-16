@@ -200,22 +200,25 @@ HRESULT FluxMicMediaSource::Initialize(IMFAttributes* pActivateAttributes) {
         }
     }
 
-    // Create media types — offer multiple resolutions and formats for maximum compatibility.
-    // Frame Server picks the best match for what the consumer app requests.
-    // NV12 is preferred (native camera format), RGB32 as fallback.
-    const UINT32 kResolutions[][3] = {
+    // Create media types — offer multiple resolutions and frame rates for maximum
+    // compatibility. Frame Server picks the best match for what the consumer app
+    // requests. NV12 is the native camera format; we include it at every combo.
+    // The BgraToNv12Pitched scaler handles any source→dest resolution mismatch.
+    struct ResEntry { UINT32 w, h, fps; };
+    const ResEntry kResolutions[] = {
         { 1920, 1080, 30 },
+        { 1920, 1080, 60 },
         { 1280,  720, 30 },
+        { 1280,  720, 60 },
+        {  640,  480, 30 },
     };
     const int kNumRes = sizeof(kResolutions) / sizeof(kResolutions[0]);
-    const int kNumTypes = kNumRes * 2; // NV12 + RGB32 per resolution
+    const int kNumTypes = kNumRes; // NV12 only — simpler, covers all apps
 
-    IMFMediaType* pMediaTypes[4] = {}; // kNumRes * 2
+    IMFMediaType* pMediaTypes[5] = {}; // kNumRes
     int typeIdx = 0;
     for (int i = 0; i < kNumRes; i++) {
-        hr = CreateMediaType(&pMediaTypes[typeIdx++], kResolutions[i][0], kResolutions[i][1], kResolutions[i][2], MFVideoFormat_NV12);
-        if (FAILED(hr)) { for (int j = 0; j < typeIdx; j++) if (pMediaTypes[j]) pMediaTypes[j]->Release(); return hr; }
-        hr = CreateMediaType(&pMediaTypes[typeIdx++], kResolutions[i][0], kResolutions[i][1], kResolutions[i][2], MFVideoFormat_RGB32);
+        hr = CreateMediaType(&pMediaTypes[typeIdx++], kResolutions[i].w, kResolutions[i].h, kResolutions[i].fps, MFVideoFormat_NV12);
         if (FAILED(hr)) { for (int j = 0; j < typeIdx; j++) if (pMediaTypes[j]) pMediaTypes[j]->Release(); return hr; }
     }
 
