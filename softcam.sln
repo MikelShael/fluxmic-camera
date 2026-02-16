@@ -11,6 +11,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "dll_tests", "tests\dll_test
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "softcamcore", "src\softcamcore\softcamcore.vcxproj", "{DF9D5A2D-3BED-4D1A-8484-22A654C9AD76}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "fluxmic_mf_source", "src\mf_source\fluxmic_mf_source.vcxproj", "{B3F7A821-4D2E-4F9A-8C1B-5E6D7F8A9B0C}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{188CE909-5FAB-49B2-9C9E-5F3405CF343A}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "core_tests", "tests\core_tests\core_tests.vcxproj", "{13B2EA6E-E43F-4B6A-9709-B25181CB8115}"
@@ -63,6 +65,12 @@ Global
 		{13B2EA6E-E43F-4B6A-9709-B25181CB8115}.Release|Win32.Build.0 = Release|Win32
 		{13B2EA6E-E43F-4B6A-9709-B25181CB8115}.Release|x64.ActiveCfg = Release|x64
 		{13B2EA6E-E43F-4B6A-9709-B25181CB8115}.Release|x64.Build.0 = Release|x64
+		{B3F7A821-4D2E-4F9A-8C1B-5E6D7F8A9B0C}.Debug|Win32.ActiveCfg = Debug|x64
+		{B3F7A821-4D2E-4F9A-8C1B-5E6D7F8A9B0C}.Debug|x64.ActiveCfg = Debug|x64
+		{B3F7A821-4D2E-4F9A-8C1B-5E6D7F8A9B0C}.Debug|x64.Build.0 = Debug|x64
+		{B3F7A821-4D2E-4F9A-8C1B-5E6D7F8A9B0C}.Release|Win32.ActiveCfg = Release|x64
+		{B3F7A821-4D2E-4F9A-8C1B-5E6D7F8A9B0C}.Release|x64.ActiveCfg = Release|x64
+		{B3F7A821-4D2E-4F9A-8C1B-5E6D7F8A9B0C}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

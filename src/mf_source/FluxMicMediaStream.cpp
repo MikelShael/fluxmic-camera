@@ -74,9 +74,8 @@ FluxMicMediaStream::FluxMicMediaStream(FluxMicMediaSource* pParent, IMFStreamDes
         }
     }
 
-    // Pre-allocate buffers for 1080p
-    m_bgraBuffer.resize(kMaxWidth * kMaxHeight * 4);
-    m_nv12Buffer.resize(kMaxWidth * kMaxHeight * 3 / 2);
+    // Pre-allocate NAL buffer for max H.264 frame
+    m_nalBuffer.resize(kMaxFrameDataSize);
 }
 
 FluxMicMediaStream::~FluxMicMediaStream() {
@@ -187,6 +186,11 @@ STDMETHODIMP FluxMicMediaStream::RequestSample(IUnknown* pToken) {
         return MF_E_INVALIDREQUEST;
     }
 
+    // Performance timing
+    LARGE_INTEGER tStart, tPipeRead, tDecode, tCopy, tFreq;
+    QueryPerformanceCounter(&tStart);
+    QueryPerformanceFrequency(&tFreq);
+
     // Log all requests (first 10 verbose, then every 100th)
     if (m_sampleIndex < 10 || m_sampleIndex % 100 == 0) {
         StreamDbgLog("[FluxMic] Stream::RequestSample #%llu (allocator=%p)\n", m_sampleIndex, m_pSampleAllocator);
@@ -198,31 +202,82 @@ STDMETHODIMP FluxMicMediaStream::RequestSample(IUnknown* pToken) {
         StreamDbgLog("[FluxMic] Stream::RequestSample pipe open=%d\n", opened);
     }
 
-    IMFSample* pSample = nullptr;
-    HRESULT hr = E_FAIL;
+    // Initialize H.264 decoder on first use (lazy init)
+    if (!m_decoderInitialized) {
+        if (m_h264Decoder.Initialize()) {
+            m_decoderInitialized = true;
+            StreamDbgLog("[FluxMic] H.264 decoder initialized (MF H.264 MFT)\n");
+        } else {
+            StreamDbgLog("[FluxMic] H.264 decoder init FAILED\n");
+        }
+    }
 
-    // Try to read a frame from the pipe.
-    // Use a small timeout (5ms) to give the pipe a chance to have data.
-    // Frame Server runs at ~30fps (33ms/sample), so 5ms of wait is acceptable.
-    bool haveSharedFrame = false;
-    FrameHeader header = {};
-    if (m_frameReader.IsOpen()) {
+    // Try to read H.264 NAL data from the pipe and decode
+    bool haveDecodedFrame = false;
+    uint32_t decodedW = 0, decodedH = 0;
+    const uint8_t* decodedNv12 = nullptr;
+
+    if (m_frameReader.IsOpen() && m_decoderInitialized) {
         bool gotFrame = m_frameReader.WaitForFrame(5);
+        QueryPerformanceCounter(&tPipeRead);
+
         if (m_sampleIndex < 10) {
             StreamDbgLog("[FluxMic] Stream::RequestSample WaitForFrame(5)=%d\n", gotFrame);
         }
-        if (gotFrame && m_frameReader.ReadHeader(header)) {
-            if (header.frame_size <= m_bgraBuffer.size() || (m_bgraBuffer.resize(header.frame_size), true)) {
-                if (m_frameReader.ReadFrameData(m_bgraBuffer.data(), m_bgraBuffer.size(), header)) {
-                    haveSharedFrame = true;
+
+        if (gotFrame) {
+            FrameHeader header = {};
+            if (m_frameReader.ReadHeader(header)) {
+                // Ensure NAL buffer is large enough
+                if (header.frame_size > m_nalBuffer.size()) {
+                    m_nalBuffer.resize(header.frame_size);
+                }
+                if (m_frameReader.ReadFrameData(m_nalBuffer.data(), m_nalBuffer.size(), header)) {
                     if (m_sampleIndex < 10 || m_sampleIndex % 100 == 0) {
-                        StreamDbgLog("[FluxMic] Stream::RequestSample got frame %ux%u seq=%u\n",
-                                     header.width, header.height, header.sequence);
+                        StreamDbgLog("[FluxMic] Stream::RequestSample got H.264 NAL seq=%u size=%u\n",
+                                     header.sequence, header.frame_size);
+                    }
+
+                    // Decode H.264 NAL -> NV12
+                    if (m_h264Decoder.DecodeNal(m_nalBuffer.data(), header.frame_size)) {
+                        decodedW = m_h264Decoder.GetDecodedWidth();
+                        decodedH = m_h264Decoder.GetDecodedHeight();
+                        decodedNv12 = m_h264Decoder.GetDecodedData();
+                        haveDecodedFrame = true;
+
+                        // Cache this decoded frame for repeat
+                        uint32_t nv12Size = decodedW * decodedH * 3 / 2;
+                        if (m_lastNv12.size() < nv12Size) {
+                            m_lastNv12.resize(nv12Size);
+                        }
+                        memcpy(m_lastNv12.data(), decodedNv12, nv12Size);
+                        m_lastDecodedWidth = decodedW;
+                        m_lastDecodedHeight = decodedH;
+                        m_hasLastFrame = true;
+
+                        if (m_sampleIndex < 10 || m_sampleIndex % 100 == 0) {
+                            StreamDbgLog("[FluxMic] Stream::RequestSample decoded NV12 %ux%u\n",
+                                         decodedW, decodedH);
+                        }
                     }
                 }
             }
         }
+
+        // No new decoded frame — re-use cached last-good NV12 frame
+        if (!haveDecodedFrame && m_hasLastFrame) {
+            decodedW = m_lastDecodedWidth;
+            decodedH = m_lastDecodedHeight;
+            decodedNv12 = m_lastNv12.data();
+            haveDecodedFrame = true;
+        }
+    } else {
+        QueryPerformanceCounter(&tPipeRead);
     }
+    QueryPerformanceCounter(&tDecode);
+
+    IMFSample* pSample = nullptr;
+    HRESULT hr = E_FAIL;
 
     // Create sample using allocator if available, otherwise fallback
     if (m_pSampleAllocator) {
@@ -233,9 +288,6 @@ STDMETHODIMP FluxMicMediaStream::RequestSample(IUnknown* pToken) {
         if (SUCCEEDED(hr) && pSample) {
             IMFMediaBuffer* pBuffer = nullptr;
             hr = pSample->GetBufferByIndex(0, &pBuffer);
-            if (m_sampleIndex < 10) {
-                StreamDbgLog("[FluxMic] Stream::RequestSample GetBufferByIndex -> 0x%08X\n", hr);
-            }
             if (SUCCEEDED(hr)) {
                 // Try 2D buffer path first
                 IMF2DBuffer2* p2DBuffer = nullptr;
@@ -247,27 +299,20 @@ STDMETHODIMP FluxMicMediaStream::RequestSample(IUnknown* pToken) {
                     DWORD cbBufferLength = 0;
                     hr = p2DBuffer->Lock2DSize(MF2DBuffer_LockFlags_Write, &pbScanline0, &pitch, &pbBufferStart, &cbBufferLength);
                     if (m_sampleIndex < 10) {
-                        StreamDbgLog("[FluxMic] Stream::RequestSample Lock2DSize -> 0x%08X (pitch=%ld, bufLen=%lu, scanline=%p)\n",
-                                     hr, pitch, cbBufferLength, pbScanline0);
+                        StreamDbgLog("[FluxMic] Stream::RequestSample Lock2DSize -> 0x%08X (pitch=%ld, bufLen=%lu)\n",
+                                     hr, pitch, cbBufferLength);
                     }
                     if (SUCCEEDED(hr)) {
-                        // Derive actual frame dimensions from buffer geometry.
-                        // The allocator may give a different size than our stream descriptor
-                        // (e.g. 1280x720 instead of 1920x1080).
                         UINT32 bufW = (pitch > 0) ? (UINT32)pitch : m_width;
                         UINT32 bufH = (cbBufferLength > 0 && pitch > 0)
                                       ? (UINT32)(cbBufferLength / pitch * 2 / 3)
                                       : m_height;
-                        if (m_sampleIndex < 10) {
-                            StreamDbgLog("[FluxMic] Stream::RequestSample 2D buffer: bufW=%u bufH=%u (m_width=%u m_height=%u)\n",
-                                         bufW, bufH, m_width, m_height);
-                        }
 
-                        if (haveSharedFrame) {
-                            BgraToNv12Pitched(m_bgraBuffer.data(), pbScanline0, pitch,
-                                              bufW, bufH, header.width, header.height);
+                        if (haveDecodedFrame && decodedNv12) {
+                            CopyNv12ToBuffer(decodedNv12, decodedW, decodedH,
+                                             pbScanline0, pitch, bufW, bufH);
                         } else {
-                            // Black frame: Y=16, UV=128 — use BUFFER dimensions, not m_width/m_height
+                            // Black frame: Y=16, UV=128
                             for (UINT32 row = 0; row < bufH; row++) {
                                 memset(pbScanline0 + row * pitch, 16, bufW);
                             }
@@ -289,10 +334,10 @@ STDMETHODIMP FluxMicMediaStream::RequestSample(IUnknown* pToken) {
                     DWORD maxLen = 0;
                     hr = pBuffer->Lock(&pDst, &maxLen, nullptr);
                     if (SUCCEEDED(hr)) {
-                        if (haveSharedFrame) {
-                            uint32_t nv12Size = header.width * header.height * 3 / 2;
+                        if (haveDecodedFrame && decodedNv12) {
+                            uint32_t nv12Size = decodedW * decodedH * 3 / 2;
                             if (nv12Size <= maxLen) {
-                                BgraToNv12(m_bgraBuffer.data(), pDst, header.width, header.height);
+                                memcpy(pDst, decodedNv12, nv12Size);
                                 pBuffer->SetCurrentLength(nv12Size);
                             }
                         } else {
@@ -312,22 +357,16 @@ STDMETHODIMP FluxMicMediaStream::RequestSample(IUnknown* pToken) {
         } else {
             // AllocateSample failed — fall back to manual sample
             if (m_sampleIndex < 10) {
-                StreamDbgLog("[FluxMic] Stream::RequestSample AllocateSample failed (hr=0x%08X), using manual fallback\n", hr);
+                StreamDbgLog("[FluxMic] Stream::RequestSample AllocateSample failed (hr=0x%08X)\n", hr);
             }
-            if (haveSharedFrame) {
-                hr = CreateSampleFromSharedMemory(&pSample, header);
-            } else {
-                hr = CreateBlackSample(&pSample);
-            }
-        }
-    } else {
-        // No allocator — create sample manually
-        if (haveSharedFrame) {
-            hr = CreateSampleFromSharedMemory(&pSample, header);
-        } else {
             hr = CreateBlackSample(&pSample);
         }
+    } else {
+        // No allocator — create black sample
+        hr = CreateBlackSample(&pSample);
     }
+
+    QueryPerformanceCounter(&tCopy);
 
     if (SUCCEEDED(hr) && pSample) {
         // Set timestamp
@@ -339,14 +378,21 @@ STDMETHODIMP FluxMicMediaStream::RequestSample(IUnknown* pToken) {
             pSample->SetUnknown(MFSampleExtension_Token, pToken);
         }
         hr = m_pEventQueue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, pSample);
-        if (m_sampleIndex < 10 || m_sampleIndex % 100 == 0) {
-            StreamDbgLog("[FluxMic] Stream::RequestSample delivered sample #%llu (haveFrame=%d, hr=0x%08X)\n",
-                         m_sampleIndex, haveSharedFrame, hr);
+
+        // Performance log: pipe_ms | decode_ms | copy_ms | total_ms
+        if (m_sampleIndex < 20 || m_sampleIndex % 100 == 0) {
+            double pipeMs   = (double)(tPipeRead.QuadPart - tStart.QuadPart) * 1000.0 / tFreq.QuadPart;
+            double decodeMs = (double)(tDecode.QuadPart - tPipeRead.QuadPart) * 1000.0 / tFreq.QuadPart;
+            double copyMs   = (double)(tCopy.QuadPart - tDecode.QuadPart) * 1000.0 / tFreq.QuadPart;
+            double totalMs  = (double)(tCopy.QuadPart - tStart.QuadPart) * 1000.0 / tFreq.QuadPart;
+            StreamDbgLog("[FluxMic] Sample #%llu decoded=%d pipe=%.1fms dec=%.1fms copy=%.1fms total=%.1fms\n",
+                         m_sampleIndex, haveDecodedFrame, pipeMs, decodeMs, copyMs, totalMs);
         }
+
         pSample->Release();
         m_sampleIndex++;
     } else {
-        StreamDbgLog("[FluxMic] Stream::RequestSample FAILED to create sample (hr=0x%08X, pSample=%p)\n", hr, pSample);
+        StreamDbgLog("[FluxMic] Stream::RequestSample FAILED (hr=0x%08X, pSample=%p)\n", hr, pSample);
     }
 
     return hr;
@@ -388,8 +434,6 @@ HRESULT FluxMicMediaStream::Start(UINT64 startTime) {
     m_startTime = startTime;
     m_sampleIndex = 0;
 
-    // Delegate to the common running-state path (initializes allocator,
-    // sets state, queues MEStreamStarted). No lock needed — we already hold it.
     m_streamState = MF_STREAM_STATE_RUNNING;
     InitializeAllocatorLocked();
     m_pEventQueue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
@@ -401,6 +445,7 @@ HRESULT FluxMicMediaStream::Stop() {
     std::lock_guard<std::mutex> lock(m_lock);
     m_streamState = MF_STREAM_STATE_STOPPED;
     m_frameReader.Close();
+    m_hasLastFrame = false;
     m_pEventQueue->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
     return S_OK;
 }
@@ -411,6 +456,8 @@ HRESULT FluxMicMediaStream::Shutdown() {
     m_isShutdown = true;
 
     m_frameReader.Close();
+    m_h264Decoder.Shutdown();
+    m_decoderInitialized = false;
 
     if (m_pSampleAllocator) {
         m_pSampleAllocator->Release();
@@ -479,44 +526,7 @@ void FluxMicMediaStream::InitializeAllocatorLocked() {
     }
 }
 
-HRESULT FluxMicMediaStream::CreateSampleFromSharedMemory(IMFSample** ppSample, const FrameHeader& header) {
-    if (!ppSample) return E_POINTER;
-    *ppSample = nullptr;
-
-    // Convert BGRA → NV12
-    uint32_t nv12Size = header.width * header.height * 3 / 2;
-    if (nv12Size > m_nv12Buffer.size()) {
-        m_nv12Buffer.resize(nv12Size);
-    }
-    BgraToNv12(m_bgraBuffer.data(), m_nv12Buffer.data(), header.width, header.height);
-
-    // Create MF sample + buffer
-    IMFSample* pSample = nullptr;
-    HRESULT hr = MFCreateSample(&pSample);
-    if (FAILED(hr)) return hr;
-
-    IMFMediaBuffer* pBuffer = nullptr;
-    hr = MFCreateMemoryBuffer(nv12Size, &pBuffer);
-    if (FAILED(hr)) { pSample->Release(); return hr; }
-
-    // Copy NV12 data into MF buffer
-    BYTE* pDst = nullptr;
-    hr = pBuffer->Lock(&pDst, nullptr, nullptr);
-    if (SUCCEEDED(hr)) {
-        memcpy(pDst, m_nv12Buffer.data(), nv12Size);
-        pBuffer->Unlock();
-        pBuffer->SetCurrentLength(nv12Size);
-    }
-
-    hr = pSample->AddBuffer(pBuffer);
-    pBuffer->Release();
-    if (FAILED(hr)) { pSample->Release(); return hr; }
-
-    *ppSample = pSample;
-    return S_OK;
-}
-
-/// Generate a black NV12 frame when no shared memory data is available.
+/// Generate a black NV12 frame when no decoded data is available.
 HRESULT FluxMicMediaStream::CreateBlackSample(IMFSample** ppSample) {
     if (!ppSample) return E_POINTER;
 
@@ -550,74 +560,57 @@ HRESULT FluxMicMediaStream::CreateBlackSample(IMFSample** ppSample) {
     return S_OK;
 }
 
-/// Convert BGRA (bottom-up DIB) to NV12 format with pitch (for 2D buffers).
-/// Handles resolution mismatch: scales srcW x srcH BGRA to dstW x dstH NV12
-/// using nearest-neighbor sampling when dimensions differ.
-void FluxMicMediaStream::BgraToNv12Pitched(const uint8_t* bgra, uint8_t* dst,
-                                            LONG pitch,
-                                            uint32_t dstW, uint32_t dstH,
-                                            uint32_t srcW, uint32_t srcH) {
-    const uint32_t srcStride = srcW * 4;
-    uint8_t* yPlane = dst;
-    uint8_t* uvPlane = dst + dstH * pitch;
+/// Copy decoded NV12 data to a 2D allocator buffer, handling pitch and
+/// resolution mismatch via nearest-neighbor scaling in NV12 space.
+void FluxMicMediaStream::CopyNv12ToBuffer(
+    const uint8_t* nv12Src, uint32_t srcW, uint32_t srcH,
+    uint8_t* dst, LONG pitch, uint32_t dstW, uint32_t dstH)
+{
+    uint8_t* yDst = dst;
+    uint8_t* uvDst = dst + dstH * pitch;
 
-    for (uint32_t dy = 0; dy < dstH; dy++) {
-        // Map destination row to source row (nearest-neighbor)
-        uint32_t sy = (uint32_t)((uint64_t)dy * srcH / dstH);
-        // BGRA is bottom-up: row 0 = bottom, so flip vertically
-        const uint8_t* srcRow = bgra + (srcH - 1 - sy) * srcStride;
-        uint8_t* yRow = yPlane + dy * pitch;
+    const uint8_t* ySrc = nv12Src;
+    const uint8_t* uvSrc = nv12Src + srcW * srcH;
 
-        for (uint32_t dx = 0; dx < dstW; dx++) {
-            // Map destination column to source column
-            uint32_t sx = (uint32_t)((uint64_t)dx * srcW / dstW);
-            uint8_t b = srcRow[sx * 4 + 0];
-            uint8_t g = srcRow[sx * 4 + 1];
-            uint8_t r = srcRow[sx * 4 + 2];
-            int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            yRow[dx] = (uint8_t)std::clamp(yVal, 0, 255);
-
-            if ((dx & 1) == 0 && (dy & 1) == 0) {
-                int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                uint8_t* uvRow = uvPlane + (dy / 2) * pitch;
-                uvRow[dx]     = (uint8_t)std::clamp(uVal, 0, 255);
-                uvRow[dx + 1] = (uint8_t)std::clamp(vVal, 0, 255);
+    if (srcW == dstW && srcH == dstH && (LONG)srcW == pitch) {
+        // Perfect match — straight memcpy
+        memcpy(yDst, ySrc, srcW * srcH);
+        memcpy(uvDst, uvSrc, srcW * srcH / 2);
+    } else if (srcW == dstW && srcH == dstH) {
+        // Same dimensions, different pitch — copy row by row
+        // Y plane
+        for (uint32_t row = 0; row < srcH; row++) {
+            memcpy(yDst + row * pitch, ySrc + row * srcW, srcW);
+        }
+        // UV plane
+        for (uint32_t row = 0; row < srcH / 2; row++) {
+            memcpy(uvDst + row * pitch, uvSrc + row * srcW, srcW);
+        }
+    } else {
+        // Resolution mismatch — nearest-neighbor scale in NV12 space
+        // Y plane
+        for (uint32_t dy = 0; dy < dstH; dy++) {
+            uint32_t sy = (uint32_t)((uint64_t)dy * srcH / dstH);
+            const uint8_t* srcRow = ySrc + sy * srcW;
+            uint8_t* dstRow = yDst + dy * pitch;
+            for (uint32_t dx = 0; dx < dstW; dx++) {
+                uint32_t sx = (uint32_t)((uint64_t)dx * srcW / dstW);
+                dstRow[dx] = srcRow[sx];
             }
         }
-    }
-}
-
-/// Convert BGRA (bottom-up DIB) to NV12 format.
-/// NV12 layout: Y plane (width*height) then interleaved UV plane (width*height/2).
-/// Uses BT.601 coefficients matching the decoder's color space.
-void FluxMicMediaStream::BgraToNv12(const uint8_t* bgra, uint8_t* nv12,
-                                     uint32_t width, uint32_t height) {
-    const uint32_t stride = width * 4;
-    uint8_t* yPlane = nv12;
-    uint8_t* uvPlane = nv12 + width * height;
-
-    for (uint32_t y = 0; y < height; y++) {
-        // BGRA is bottom-up: row 0 in buffer = bottom of image
-        // NV12 is top-down: row 0 = top of image
-        const uint8_t* srcRow = bgra + (height - 1 - y) * stride;
-
-        for (uint32_t x = 0; x < width; x++) {
-            uint8_t b = srcRow[x * 4 + 0];
-            uint8_t g = srcRow[x * 4 + 1];
-            uint8_t r = srcRow[x * 4 + 2];
-
-            // BT.601 RGB -> YUV
-            int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            yPlane[y * width + x] = (uint8_t)std::clamp(yVal, 0, 255);
-
-            // Subsample UV: every 2x2 block
-            if ((x & 1) == 0 && (y & 1) == 0) {
-                int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                uint32_t uvIdx = (y / 2) * width + x;
-                uvPlane[uvIdx]     = (uint8_t)std::clamp(uVal, 0, 255);
-                uvPlane[uvIdx + 1] = (uint8_t)std::clamp(vVal, 0, 255);
+        // UV plane (half resolution)
+        uint32_t srcUvH = srcH / 2;
+        uint32_t dstUvH = dstH / 2;
+        uint32_t srcUvW = srcW;  // UV stride = srcW (interleaved U,V pairs)
+        uint32_t dstUvW = dstW;
+        for (uint32_t dy = 0; dy < dstUvH; dy++) {
+            uint32_t sy = (uint32_t)((uint64_t)dy * srcUvH / dstUvH);
+            const uint8_t* srcRow = uvSrc + sy * srcUvW;
+            uint8_t* dstRow = uvDst + dy * pitch;
+            for (uint32_t dx = 0; dx < dstUvW; dx += 2) {
+                uint32_t sx = (uint32_t)((uint64_t)dx * srcUvW / dstUvW) & ~1u;
+                dstRow[dx]     = srcRow[sx];     // U
+                dstRow[dx + 1] = srcRow[sx + 1]; // V
             }
         }
     }

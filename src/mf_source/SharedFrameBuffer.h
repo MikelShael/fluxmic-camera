@@ -8,16 +8,16 @@
 /// to the Media Foundation virtual camera source DLL.
 ///
 /// The FluxMic app (Rust/Tauri) creates a named pipe server and writes
-/// BGRA frames as messages. This DLL (running inside Frame Server, Session 0)
+/// H.264 NAL data as messages. This DLL (running inside Frame Server, Session 0)
 /// connects as a pipe client and reads frames on RequestSample().
 ///
 /// Wire format per message:
-///   Bytes 0-3:    width       (uint32_t LE)
-///   Bytes 4-7:    height      (uint32_t LE)
+///   Bytes 0-3:    width       (uint32_t LE, from SPS or 0 if unknown)
+///   Bytes 4-7:    height      (uint32_t LE, from SPS or 0 if unknown)
 ///   Bytes 8-15:   timestamp   (uint64_t LE, QPC ticks)
 ///   Bytes 16-19:  sequence    (uint32_t LE, wrapping counter)
-///   Bytes 20-23:  frame_size  (uint32_t LE, actual BGRA data size)
-///   Bytes 24+:    BGRA pixel data (width * height * 4, bottom-up DIB order)
+///   Bytes 20-23:  data_size   (uint32_t LE, H.264 NAL data size in bytes)
+///   Bytes 24+:    Raw H.264 Annex B NAL data (with 0x00000001 start codes)
 
 namespace FluxMic {
 
@@ -28,10 +28,12 @@ static const wchar_t* kPipeName = L"\\\\.\\pipe\\FluxMicVideoFeed";
 // Header size in the wire message
 static const size_t kHeaderSize = 24;
 
-// Max supported resolution (1920x1080 BGRA = ~8MB)
+// Max supported resolution
 static const uint32_t kMaxWidth  = 1920;
 static const uint32_t kMaxHeight = 1080;
-static const size_t kMaxFrameDataSize = kMaxWidth * kMaxHeight * 4;
+
+// Max H.264 NAL data size per message (4MB — sufficient for worst-case keyframes)
+static const size_t kMaxFrameDataSize = 4 * 1024 * 1024;
 static const size_t kMaxMessageSize = kHeaderSize + kMaxFrameDataSize;
 
 #pragma pack(push, 1)
@@ -40,7 +42,7 @@ struct FrameHeader {
     uint32_t height;
     uint64_t timestamp;   // QPC ticks
     uint32_t sequence;    // wrapping frame counter
-    uint32_t frame_size;  // actual BGRA data size in bytes
+    uint32_t frame_size;  // H.264 NAL data size in bytes
 };
 #pragma pack(pop)
 

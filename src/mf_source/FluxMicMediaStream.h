@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "SharedFrameBuffer.h"
+#include "H264Decoder.h"
 
 namespace FluxMic {
 
@@ -17,8 +18,8 @@ class FluxMicMediaSource;
 
 /// IMFMediaStream2 implementation for the FluxMic virtual camera.
 ///
-/// Reads BGRA frames from shared memory, converts to NV12 format,
-/// and delivers them as IMFSamples when RequestSample() is called.
+/// Reads H.264 NAL data from the named pipe, decodes to NV12 via the
+/// MF H.264 decoder MFT, and delivers NV12 frames as IMFSamples.
 class FluxMicMediaStream :
     public IMFMediaStream2
 {
@@ -57,12 +58,9 @@ private:
     ~FluxMicMediaStream();
 
     void InitializeAllocatorLocked();  // must be called with m_lock held
-    HRESULT CreateSampleFromSharedMemory(IMFSample** ppSample, const FrameHeader& header);
     HRESULT CreateBlackSample(IMFSample** ppSample);
-    void BgraToNv12(const uint8_t* bgra, uint8_t* nv12, uint32_t width, uint32_t height);
-    void BgraToNv12Pitched(const uint8_t* bgra, uint8_t* dst, LONG pitch,
-                           uint32_t dstW, uint32_t dstH,
-                           uint32_t srcW, uint32_t srcH);
+    void CopyNv12ToBuffer(const uint8_t* nv12Src, uint32_t srcW, uint32_t srcH,
+                          uint8_t* dst, LONG pitch, uint32_t dstW, uint32_t dstH);
 
     std::atomic<LONG> m_refCount{1};
     std::mutex m_lock;
@@ -85,10 +83,18 @@ private:
     UINT32 m_width = 1920;
     UINT32 m_height = 1080;
 
-    // Reusable buffer for BGRA frame data
-    std::vector<uint8_t> m_bgraBuffer;
-    // Reusable buffer for NV12 conversion
-    std::vector<uint8_t> m_nv12Buffer;
+    // H.264 decoder (MF H.264 MFT, lazy-initialized)
+    H264Decoder m_h264Decoder;
+    bool m_decoderInitialized = false;
+
+    // Reusable buffer for H.264 NAL data from pipe
+    std::vector<uint8_t> m_nalBuffer;
+
+    // Cached last-good NV12 frame for repeat when pipe has no new data
+    bool m_hasLastFrame = false;
+    std::vector<uint8_t> m_lastNv12;
+    uint32_t m_lastDecodedWidth = 0;
+    uint32_t m_lastDecodedHeight = 0;
 };
 
 } // namespace FluxMic

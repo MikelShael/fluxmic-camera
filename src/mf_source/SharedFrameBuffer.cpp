@@ -129,9 +129,7 @@ bool SharedFrameReader::WaitForFrame(DWORD timeoutMs) {
                 FrameHeader hdr;
                 memcpy(&hdr, m_readBuffer.data(), sizeof(FrameHeader));
 
-                if (hdr.width == 0 || hdr.height == 0) return readOk;
-                if (hdr.width > kMaxWidth || hdr.height > kMaxHeight) return readOk;
-                if (hdr.frame_size != hdr.width * hdr.height * 4) return readOk;
+                if (hdr.frame_size == 0 || hdr.frame_size > kMaxFrameDataSize) return readOk;
                 if (bytesRead != kHeaderSize + hdr.frame_size) return readOk;
 
                 m_cachedHeader = hdr;

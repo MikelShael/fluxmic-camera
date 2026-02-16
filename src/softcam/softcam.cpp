@@ -7,17 +7,17 @@
 #include <softcamcore/SenderAPI.h>
 
 
-// {AEF3B972-5FA5-4647-9571-358EB472BC9E}
-DEFINE_GUID(CLSID_DShowSoftcam,
-0xaef3b972, 0x5fa5, 0x4647, 0x95, 0x71, 0x35, 0x8e, 0xb4, 0x72, 0xbc, 0x9e);
+// {9BFFEA25-C00A-46B8-9333-3C3F09733229}
+DEFINE_GUID(CLSID_FluxMicCamera,
+0x9bffea25, 0xc00a, 0x46b8, 0x93, 0x33, 0x3c, 0x3f, 0x09, 0x73, 0x32, 0x29);
 
 
 namespace {
 
 // Setup data
 
-const wchar_t FILTER_NAME[] = L"DirectShow Softcam";
-const GUID &FILTER_CLASSID = CLSID_DShowSoftcam;
+const wchar_t FILTER_NAME[] = L"FluxMic Camera";
+const GUID &FILTER_CLASSID = CLSID_FluxMicCamera;
 
 const AMOVIESETUP_MEDIATYPE s_pin_types[] =
 {
